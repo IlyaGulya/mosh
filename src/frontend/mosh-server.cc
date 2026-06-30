@@ -84,9 +84,9 @@
 #include "src/statesync/user.h"
 #include "src/util/fatal_assert.h"
 #include "src/util/locale_utils.h"
+#include "src/util/nonblocking_writer.h"
 #include "src/util/pty_compat.h"
 #include "src/util/select.h"
-#include "src/util/swrite.h"
 #include "src/util/timestamp.h"
 
 #ifndef _PATH_BSHELL
@@ -133,6 +133,18 @@ static bool print_motd( const char* filename );
 static void chdir_homedir( void );
 static bool motd_hushed( void );
 static void warn_unattached( const std::string& ignore_entry );
+
+static void set_nonblocking( int fd )
+{
+  int flags = fcntl( fd, F_GETFL, 0 );
+  if ( flags < 0 ) {
+    err( 1, "fcntl F_GETFL" );
+  }
+
+  if ( fcntl( fd, F_SETFL, flags | O_NONBLOCK ) < 0 ) {
+    err( 1, "fcntl F_SETFL" );
+  }
+}
 
 /* Simple spinloop */
 static void spin( void )
@@ -633,6 +645,8 @@ static int run_server( const char* desired_ip,
     }
   } else {
     /* parent */
+    set_nonblocking( master );
+
     if ( close( pipes[0] ) < 0 ) {
       perror( "parent read pipe close" );
       exit( 1 );
@@ -711,6 +725,8 @@ static void serve( int host_fd,
 #endif
 
   bool child_released = false;
+  static const size_t max_pending_host_write = 1024 * 1024;
+  NonblockingWriter host_write;
 
   while ( true ) {
     try {
@@ -739,13 +755,20 @@ static void serve( int host_fd,
       }
 
       /* poll for events */
+      /* Bound pty input memory when the child stops reading. */
+      bool read_network = host_write.size() < max_pending_host_write;
       sel.clear_fds();
       std::vector<int> fd_list( network.fds() );
       assert( fd_list.size() == 1 ); /* servers don't hop */
       int network_fd = fd_list.back();
-      sel.add_fd( network_fd );
+      if ( read_network ) {
+        sel.add_fd( network_fd );
+      }
       if ( !network.shutdown_in_progress() ) {
         sel.add_fd( host_fd );
+      }
+      if ( !host_write.empty() ) {
+        sel.add_write_fd( host_fd );
       }
 
       int active_fds = sel.select( timeout );
@@ -758,7 +781,13 @@ static void serve( int host_fd,
       uint64_t time_since_remote_state = now - network.get_latest_remote_state().timestamp;
       std::string terminal_to_host;
 
-      if ( sel.read( network_fd ) ) {
+      if ( !host_write.empty() && sel.write( host_fd ) ) {
+        if ( !host_write.flush( host_fd ) ) {
+          network.start_shutdown();
+        }
+      }
+
+      if ( read_network && sel.read( network_fd ) ) {
         /* packet received from the network */
         network.recv();
 
@@ -865,12 +894,19 @@ static void serve( int host_fd,
 
         /* fill buffer if possible */
         ssize_t bytes_read = read( host_fd, buf, buf_size );
+        bool host_read_would_block = false;
+
+        if ( bytes_read < 0 && ( errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR ) ) {
+          host_read_would_block = true;
+        }
 
         /* If the pty slave is closed, reading from the master can fail with
            EIO (see #264).  So we treat errors on read() like EOF. */
-        if ( bytes_read <= 0 ) {
+        if ( host_read_would_block ) {
+          /* Try again on the next readiness notification. */
+        } else if ( bytes_read <= 0 ) {
           network.start_shutdown();
-        } else {
+        } else if ( bytes_read > 0 ) {
           terminal_to_host += terminal.act( std::string( buf, bytes_read ) );
 
           /* update client with new state of terminal */
@@ -879,7 +915,8 @@ static void serve( int host_fd,
       }
 
       /* write user input and terminal writeback to the host */
-      if ( swrite( host_fd, terminal_to_host.c_str(), terminal_to_host.length() ) < 0 ) {
+      host_write.append( terminal_to_host );
+      if ( !host_write.flush( host_fd ) ) {
         network.start_shutdown();
       }
 

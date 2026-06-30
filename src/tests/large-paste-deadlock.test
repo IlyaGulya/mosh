@@ -1,0 +1,91 @@
+#!/bin/sh
+
+#
+# Regression test for mosh-server blocking while writing a large paste
+# into the pty master.  The command below writes a large amount of pty
+# output before reading stdin, so a blocking server write can deadlock
+# with unread pty output.
+#
+
+# shellcheck source=e2e-test-subrs
+. "$(dirname "$0")/e2e-test-subrs"
+PATH=$PATH:.:$srcdir
+
+: ${LARGE_PASTE_SIZE:=32768}
+export LARGE_PASTE_SIZE
+
+# Top-level wrapper.
+if [ $# -eq 0 ]; then
+    e2e-test "$0" tmux baseline post
+    exit
+fi
+
+tmux_commands()
+{
+    paste_file="${TMPDIR:-/tmp}/mosh-large-paste.$$"
+    dd if=/dev/zero bs="$LARGE_PASTE_SIZE" count=1 2>/dev/null | tr '\000' x > "$paste_file"
+    sleep 2
+    printf 'load-buffer -b large-paste %s\n' "$paste_file"
+    printf 'paste-buffer -b large-paste\n'
+    rm -f "$paste_file"
+    sleep 10
+    while printf "show-options\n" && sleep 1; do
+	:
+    done
+}
+
+tmux_stdin()
+{
+    tmux_commands | "$@"
+    exit
+}
+
+baseline()
+{
+    (sleep 120; kill $$) &
+    killpid=$!
+    stty raw -echo
+    perl -e '
+	$| = 1;
+	for (my $i = 0; $i < 200000; $i++) {
+	    print "\e[?25h";
+	}
+	my $want = $ENV{"LARGE_PASTE_SIZE"};
+	my $buf = "";
+	while (length($buf) < $want) {
+	    my $n = sysread(STDIN, my $chunk, $want - length($buf));
+	    last if !defined($n) || $n == 0;
+	    $buf .= $chunk;
+	}
+	open(my $out, ">", "large-paste.out") or die "large-paste.out: $!";
+	print {$out} $buf;
+	close($out);
+    '
+    status=$?
+    stty sane
+    printf "\r\n"
+    printf "=== bytes %s ===\n" "$(wc -c < large-paste.out)"
+    kill "$killpid"
+    exit "$status"
+}
+
+post()
+{
+    bytes=$(awk '/=== bytes/ { print $3 }' "$(basename "$0").d/baseline.capture" | tail -n 1)
+    if [ "$bytes" -ge 30000 ] 2>/dev/null; then
+	exit 0
+    fi
+    exit 1
+}
+
+case $1 in
+    tmux)
+	shift;
+	tmux_stdin "$@";;
+    baseline)
+	baseline;;
+    post)
+	post;;
+    *)
+	fail "unknown test argument %s\n" "$1";;
+esac
