@@ -34,6 +34,7 @@
 #include "src/include/version.h"
 
 #include <cerrno>
+#include <cstdarg>
 #include <clocale>
 #include <csignal>
 #include <cstdio>
@@ -144,6 +145,72 @@ static void set_nonblocking( int fd )
   if ( fcntl( fd, F_SETFL, flags | O_NONBLOCK ) < 0 ) {
     err( 1, "fcntl F_SETFL" );
   }
+}
+
+static bool pty_debug_requested( void )
+{
+  if ( getenv( "MOSH_SERVER_PTY_DEBUG" ) != NULL ) {
+    return true;
+  }
+
+  const char* home = getenv( "HOME" );
+  if ( home == NULL ) {
+    return false;
+  }
+
+  const std::string flag_path = std::string( home ) + "/.mosh-server-pty-debug";
+  return access( flag_path.c_str(), F_OK ) == 0;
+}
+
+static FILE* pty_debug_stream( void )
+{
+  static bool initialized = false;
+  static FILE* stream = NULL;
+
+  if ( !initialized ) {
+    initialized = true;
+
+    if ( !pty_debug_requested() ) {
+      return NULL;
+    }
+
+    const char* path = getenv( "MOSH_SERVER_PTY_DEBUG_LOG" );
+    std::string default_path;
+    if ( path == NULL ) {
+      const char* home = getenv( "HOME" );
+      if ( home != NULL ) {
+        default_path = std::string( home ) + "/mosh-server-pty-debug.log";
+        path = default_path.c_str();
+      }
+    }
+
+    if ( path != NULL ) {
+      stream = fopen( path, "a" );
+    }
+    if ( stream == NULL ) {
+      stream = stderr;
+    }
+  }
+
+  return stream;
+}
+
+static void pty_debug( const char* format, ... )
+{
+  FILE* stream = pty_debug_stream();
+  if ( stream == NULL ) {
+    return;
+  }
+
+  fprintf( stream, "[mosh-server pty pid=%ld] ", static_cast<long>( getpid() ) );
+
+  va_list args;
+  va_start( args, format );
+  vfprintf( stream, format, args );
+  va_end( args );
+
+  fputc( '\n', stream );
+  fflush( stream );
 }
 
 /* Simple spinloop */
@@ -727,6 +794,7 @@ static void serve( int host_fd,
   bool child_released = false;
   static const size_t max_pending_host_write = 1024 * 1024;
   NonblockingWriter host_write;
+  bool network_backpressured = false;
 
   while ( true ) {
     try {
@@ -757,6 +825,14 @@ static void serve( int host_fd,
       /* poll for events */
       /* Bound pty input memory when the child stops reading. */
       bool read_network = host_write.size() < max_pending_host_write;
+      if ( read_network == network_backpressured ) {
+        network_backpressured = !read_network;
+        pty_debug( "%s network reads pending_host_write=%zu limit=%zu",
+                   network_backpressured ? "paused" : "resumed",
+                   host_write.size(),
+                   max_pending_host_write );
+      }
+
       sel.clear_fds();
       std::vector<int> fd_list( network.fds() );
       assert( fd_list.size() == 1 ); /* servers don't hop */
@@ -782,8 +858,14 @@ static void serve( int host_fd,
       std::string terminal_to_host;
 
       if ( !host_write.empty() && sel.write( host_fd ) ) {
+        const size_t pending_before = host_write.size();
         if ( !host_write.flush( host_fd ) ) {
+          pty_debug( "pty flush failed pending_before=%zu", pending_before );
           network.start_shutdown();
+        } else if ( host_write.size() != pending_before ) {
+          pty_debug( "pty flush pending_before=%zu pending_after=%zu",
+                     pending_before,
+                     host_write.size() );
         }
       }
 
@@ -796,7 +878,14 @@ static void serve( int host_fd,
           last_remote_num = network.get_remote_state_num();
 
           Network::UserStream us;
-          us.apply_string( network.get_remote_diff() );
+          const std::string remote_diff = network.get_remote_diff();
+          us.apply_string( remote_diff );
+          pty_debug( "network state=%llu remote_diff=%zu user_actions=%zu",
+                     static_cast<unsigned long long>( last_remote_num ),
+                     remote_diff.size(),
+                     us.size() );
+
+          const size_t terminal_to_host_before_actions = terminal_to_host.size();
           /* apply userstream to terminal */
           for ( size_t i = 0; i < us.size(); i++ ) {
             const Parser::Action& action = us.get_action( i );
@@ -823,6 +912,10 @@ static void serve( int host_fd,
               }
             }
             terminal_to_host += terminal.act( action );
+          }
+          if ( terminal_to_host.size() != terminal_to_host_before_actions ) {
+            pty_debug( "user actions queued_to_pty=%zu",
+                       terminal_to_host.size() - terminal_to_host_before_actions );
           }
 
           if ( !us.empty() ) {
@@ -905,9 +998,14 @@ static void serve( int host_fd,
         if ( host_read_would_block ) {
           /* Try again on the next readiness notification. */
         } else if ( bytes_read <= 0 ) {
+          pty_debug( "pty read shutdown bytes_read=%zd errno=%d", bytes_read, errno );
           network.start_shutdown();
         } else if ( bytes_read > 0 ) {
+          const size_t terminal_to_host_before_read = terminal_to_host.size();
           terminal_to_host += terminal.act( std::string( buf, bytes_read ) );
+          pty_debug( "pty read bytes=%zd queued_writeback=%zu",
+                     bytes_read,
+                     terminal_to_host.size() - terminal_to_host_before_read );
 
           /* update client with new state of terminal */
           network.set_current_state( terminal );
@@ -915,9 +1013,23 @@ static void serve( int host_fd,
       }
 
       /* write user input and terminal writeback to the host */
+      const size_t append_size = terminal_to_host.size();
+      const size_t pending_before_append = host_write.size();
       host_write.append( terminal_to_host );
+      if ( append_size != 0 ) {
+        pty_debug( "pty queue append=%zu pending_before=%zu pending_after=%zu",
+                   append_size,
+                   pending_before_append,
+                   host_write.size() );
+      }
+      const size_t pending_before_flush = host_write.size();
       if ( !host_write.flush( host_fd ) ) {
+        pty_debug( "pty flush failed pending_before=%zu", pending_before_flush );
         network.start_shutdown();
+      } else if ( host_write.size() != pending_before_flush ) {
+        pty_debug( "pty flush pending_before=%zu pending_after=%zu",
+                   pending_before_flush,
+                   host_write.size() );
       }
 
       bool idle_shutdown = false;
